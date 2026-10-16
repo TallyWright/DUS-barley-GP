@@ -7,11 +7,11 @@ library(dplyr)
 library(ggplot2)
 library(tidyr)
 library(ggpubr)
-library(lme4)
-library(lmerTest)
-library(emmeans)
-library(multcomp)
-library(see)
+library(correctR)
+library(caret)
+library(multcompView)
+library(ggplot2)
+library(tidyr)
 
 #load workspace from script 7 
 load("outputs/predict_candidates/script_7_data.RData")
@@ -54,6 +54,8 @@ names(clean_all_traits$trait.9)[1] <- "2010"
 clean_all_traits$trait.20[[9]] <- filler
 clean_all_traits$trait.20[[10]] <- filler
 names(clean_all_traits$trait.20)[c(9,10)] <-c("2018", "2019")
+
+
 
 #create data frame for results
 
@@ -215,7 +217,182 @@ plot_prop_subsets<- ggplot(reduced_subset_results, aes(x = prop_of_obs_found)) +
 #save
 ggsave("outputs/predict_final_plots/fig_subsets.jpeg", ggarrange(plot_subset_compare,plot_prop_subsets, ncol=2,labels = c("a)", "b)") ), height = 5, width = 10)
 
-# Part 4 - Summary plots for predictions
+#Run updated tests for significance test between using prediction accuracies
+
+# Part 4 - sig test for cor
+
+#fix NA issue with trait.25
+dat <-read.csv("outputs/predict_outs/results_all_folds_cor_trait.25.csv", header=T)
+
+write.csv(dat,"outputs/predict_outs/orginal_before_impute_trait.25.csv")
+
+#estimate % missing values = rrBLUP_int=5, rf/rf_tune/rf_weight2 = 1.  
+colSums(is.na(dat))
+
+#fill impacted cells with mean
+dat$rrBLUP_int[is.na(dat$rrBLUP_int)]<-mean(dat$rrBLUP_int,na.rm=T)
+dat$rf[is.na(dat$rf)]<-mean(dat$rf,na.rm=T)
+dat$rf_tune[is.na(dat$rf_tune)]<-mean(dat$rf_tune,na.rm=T)
+dat$rf_weight2[is.na(dat$rf_weight2)]<-mean(dat$rf_weight2,na.rm=T)
+
+#now save imputed over original
+write.csv(dat,"outputs/predict_outs/results_all_folds_cor_trait.25.csv", row.names = F)
+
+#clean enviro
+rm(list=ls(all=TRUE))
+      
+
+#read in file list and only keep corr
+files_to_read <- list.files("outputs/predict_outs")
+files_to_read <- files_to_read [grepl("^results_all_folds_cor_trait\\.", files_to_read )]
+
+#save just traits
+traits<-gsub("results_all_folds_cor_|\\.csv", "", files_to_read)
+
+#create letter results table to save to
+
+results_cor <- data.frame(method=c("rrBLUP", 
+                                   "rrBLUP_int", 
+                                   "rf", 
+                                   "rf_tune", 
+                                   "rf_weight2", 
+                                   "rf_weight10"))
+
+#run loop for plots and table
+
+for (i in 1:length(traits)){
+  
+  #read in data
+  dat <- read.csv(paste0("outputs/predict_outs/results_all_folds_cor_",traits[i],".csv"), header = T)
+  dat_pheno <- read.csv(paste0("outputs/predict_outs/pheno_data_",traits[i],"_.csv"), 
+                        header = T,row.names = 1)
+  
+  #form test set examples
+  outer_folds<- createFolds(dat_pheno[,traits[i]], k = 10, list = TRUE, returnTrain = FALSE)
+  
+  #average size of test
+  test.set.size<-round(sum(sapply(outer_folds, length))/10)
+  
+  #form training set examples and average size
+  train.set.size<- round(sum(sapply(outer_folds, function(x){
+    length(setdiff(1:length(dat_pheno[,traits[i]]),x))}))/10)
+  
+  #remove NA methods
+  dat <- dat[,colSums(is.na(dat))<nrow(dat)]
+  
+  #form pairs
+  pairs <- combn(names(dat)[-c(1:3)], 2, simplify = FALSE)
+  
+  #run p-values on each test  
+  test.results<- lapply(pairs, function(z){
+    
+    temp <- dat[, c("iteration", "fold", z)] %>%
+      pivot_longer(cols = all_of(z), names_to = "model", values_to = "values")
+    
+    names(temp)[names(temp) == "iteration"] <- "r"
+    names(temp)[names(temp) == "fold"]      <- "k"
+    
+    temp <- as.data.frame(temp)
+    
+    repkfold_ttest(temp, 
+                   n1 =train.set.size , 
+                   n2 = test.set.size, 
+                   k=10, r=20) 
+  })
+  
+  #unlist p-values
+  p_values<-unlist(sapply(test.results,function(x){x[2]}))
+  
+  #adjust for multiple corrections
+  p_values.A<-p.adjust(p_values, method = "holm")
+  
+  #set names
+  names(p_values.A)<-sapply(pairs, function(x){paste(x[1], x[2], 
+                                                     sep="-")})  
+  #save letters
+  letters <-as.data.frame(multcompLetters(p_values.A)[1])
+  
+  #convert to wide format
+  long_data <- pivot_longer(
+    dat,
+    cols = names(dat)[-c(1:3)],
+    names_to = "method",
+    values_to = "values"
+  )
+  
+  #change factor order
+  long_data$method <- factor(long_data$method, levels = c("rrBLUP", "rrBLUP_int", "rf", "rf_tune", "rf_weight2", "rf_weight10"))
+  
+  #drop empty levels 
+  long_data$method<-droplevels(long_data$method)
+  
+  #aggregate step 1
+  plot_data <- aggregate(values~method+iteration, data=long_data, mean)
+  
+  #aggregate step 2
+  plot_data <- aggregate(values~method, data=plot_data, 
+                         FUN = function(x){c(mean=mean(x),
+                                             se=sd(x)/sqrt(length(x)))})
+  
+  plot_data <- do.call(data.frame, plot_data)
+  names(plot_data) <- c("method", "mean", "se")
+  
+  #run merge for data and letters
+  plot_data<-merge(plot_data,letters, by.x="method", by.y=0)
+  
+  #form table to save as main results
+  temp<-setNames(data.frame(plot_data$method, 
+                            paste0(sprintf("%.3f", plot_data$mean),plot_data$Letters)), 
+                 c("method", traits[i]))
+  
+  #save to main results
+  results_cor <- merge(results_cor,temp, by="method", all = T)
+  
+  #form boxplots with letter labels overlaid
+  
+  label_offset<- diff(range(plot_data$mean)) * 0.05 
+  
+  plot_point  <- ggplot(plot_data, aes(x = method, y = mean)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    geom_text(aes(label = Letters, y = mean + label_offset + se)) +
+    theme_minimal()+
+    labs(x="Method",
+         y = expression(italic("r")),
+         title =sub("trait\\.", "Characteristic no. ", traits[i]) )
+  
+  ggsave(paste0("outputs/predict_final_plots/cor_point_plot_with_letters_",
+                traits[i],".jpeg"), plot_point, 
+         height = 4, 
+         width = 5)
+  
+  
+}
+#save results
+
+#save correlation letters 
+
+#sort on of methods 
+results_cor <- results_cor[match(c("rrBLUP", 
+                                   "rrBLUP_int", 
+                                   "rf", 
+                                   "rf_tune", 
+                                   "rf_weight2", 
+                                   "rf_weight10"), results_cor$method), ]
+#move methods to row names
+row.names(results_cor) <- results_cor$method
+results_cor <-results_cor[,-1]
+
+#sort on order of traits
+trait_num <- as.numeric(gsub("trait\\.", "", names(results_cor)))
+results_cor<-results_cor[,names(results_cor)[order(trait_num)]]
+
+#save final data
+write.csv(results_cor,"outputs/predict_final_plots/cor_letters_table.csv")
+
+#############
+# Part 5 - scatter for cor
+#############
 
 #clean enviro
 rm(list=ls(all=TRUE))
@@ -233,9 +410,6 @@ trait_name<-sub("^results_cor_(trait\\.[0-9]+)\\.csv$", "\\1", files_to_read)
 #save results object
 results_cor <- data.frame()
 
-#add check for NA
-results_NA_cor <- data.frame()
-
 #run loop for bind
 
 for (i in 1:length(files_to_read)){
@@ -243,14 +417,9 @@ for (i in 1:length(files_to_read)){
   #read in data
   dat <- read.csv(paste0("outputs/predict_outs/",files_to_read[i]), header = T)
   
-  #run significance test
-  #iteration treated as a block
-  
   #convert to long format
-  
   n <- names(dat)
   dat_long<-dat
-  dat_long$iteration <- as.factor(c(1:20))
   
   dat_long <- dat_long %>%         
     pivot_longer(
@@ -260,90 +429,34 @@ for (i in 1:length(files_to_read)){
     as.data.frame()
   
   #fix factor order
-  
   dat_long$model <-factor(dat_long$model, levels= c("rrBLUP",
-                                                  "rrBLUP_int",
-                                                  "rf",
-                                                  "rf_tune",
-                                                  "rf_weight2",
-                                                  "rf_weight10"))
+                                                    "rrBLUP_int",
+                                                    "rf",
+                                                    "rf_tune",
+                                                    "rf_weight2",
+                                                    "rf_weight10"))
   #clean 
   dat_long <- dat_long[ !is.na(dat_long$accuracy),]
   dat_long <- droplevels(dat_long)
-  
-  #run mixed model
-  
-  m <- lmer(accuracy ~ model + (1|iteration), data =dat_long)
   
   #save means for cor results and anova resuts
   
   results_cor <-rbind(results_cor,
                       data.frame(traits = trait_name[i],  
-                                 as.data.frame(t(colMeans(dat, na.rm=T))),
-                                 as.data.frame(anova(m))))
-  #count na
-  
-  results_NA_cor <- rbind(results_NA_cor,
-                          data.frame(traits =trait_name[i], 
-                                     as.data.frame(t(colSums(is.na(dat))))))
-  
-  #form box plots
-  
-  #extract BLUEs/emm object
-  emm <- emmeans(m, ~ model)
-
-  #pair-wise comparisons with tukey adjustment
-  res.cld<-multcomp::cld(emm, adjust = "tukey", Letters=LETTERS, sort = F)
-  
-  #form boxplots with letter labels overlaid
-  
-  p <- ggplot(res.cld, aes(x = model, y = emmean)) +
-        geom_point(size = 3) +
-         geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.2) +
-         geom_text(aes(label = .group, y = emmean + 0.01)) +
-         theme_minimal()+
-        labs(x="Method",
-            y = expression(italic("r")),
-            title =trait_name[i] )
-  
-  #produce same plot without sig group labels
-  
-  q <- ggplot(res.cld, aes(x = model, y = emmean)) +
-    geom_point(size = 3) +
-    geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.2) +
-    theme_minimal()+
-    labs(x="Method",
-         y = expression(italic("r")),
-         title =trait_name[i] )
-  
-  ggsave(paste0("outputs/predict_final_plots/boxplot.cor.pred.sig.groups.method",
-                trait_name[i],
-                 ".jpeg"),
-                p, width = 5, height = 4)
-  ggsave(paste0("outputs/predict_final_plots/boxplot.cor.pred.no.groups.method",
-                trait_name[i],
-                ".jpeg"),
-         q, width = 5, height = 4)
+                                 as.data.frame(t(colMeans(dat, na.rm=T)))))
 }
-
-#save output
-
-write.csv(results_cor,
-          "outputs/predict_final_plots/results_cor.csv", row.names = F)
-
 #merge and plot for cor plot
 results_cor_h2<-merge(results_cor, h2, by="traits")
-
 
 dat_long_corr <- tidyr::pivot_longer(results_cor_h2, cols = c(rrBLUP,rf), names_to = "Variable", values_to = "Value")
 
 scat_corr<-ggplot(dat_long_corr, aes(x = h2, y = Value, color = Variable)) +
-         geom_point() +
+  geom_point() +
   coord_cartesian(ylim = c(0.2, 1))+
-         geom_smooth(method = "lm", se = FALSE) +
-         labs(
-           x = expression(italic("h"^2)),
-           y = expression(italic("r"))) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    x = expression(italic("h"^2)),
+    y = expression(italic("r"))) +
   theme_minimal() +
   theme(
     legend.position = c(0.85, 0.1))+
@@ -351,9 +464,169 @@ scat_corr<-ggplot(dat_long_corr, aes(x = h2, y = Value, color = Variable)) +
 
 ggsave("outputs/predict_final_plots/scatter_cor.jpeg", scat_corr, width = 6, height = 5)
 
-########
-#PCCCC #
-########
+write.csv(results_cor,
+          "outputs/predict_final_plots/results_cor.csv", row.names = F)
+
+
+# Part 6 - sig test for PCCC
+
+
+#clean enviro
+rm(list=ls(all=TRUE))
+
+
+#read in file list and only keep pcccr
+files_to_read <- list.files("outputs/predict_outs")
+files_to_read <- files_to_read [grepl("^results_all_folds_pccc_trait\\.", files_to_read )]
+
+#save just traits
+traits<-gsub("results_all_folds_pccc_|\\.csv", "", files_to_read)
+
+#create letter results table to save to
+
+results_pccc <- data.frame(method=c("rrBLUP", 
+                                    "rrBLUP_int", 
+                                    "rf", 
+                                    "rf_tune", 
+                                    "rf_weight2", 
+                                    "rf_weight10"))
+
+#run loop for plots and table
+
+for (i in 1:length(traits)){
+  
+  #read in data
+  dat <- read.csv(paste0("outputs/predict_outs/results_all_folds_pccc_",traits[i],".csv"), header = T)
+  dat_pheno <- read.csv(paste0("outputs/predict_outs/pheno_data_",traits[i],"_.csv"), 
+                        header = T,row.names = 1)
+  
+  #form test set examples
+  outer_folds<- createFolds(dat_pheno[,traits[i]], k = 10, list = TRUE, returnTrain = FALSE)
+  
+  #average size of test
+  test.set.size<-round(sum(sapply(outer_folds, length))/10)
+  
+  #form training set examples and average size
+  train.set.size<- round(sum(sapply(outer_folds, function(x){
+    length(setdiff(1:length(dat_pheno[,traits[i]]),x))}))/10)
+  
+  #remove NA methods
+  dat <- dat[,colSums(is.na(dat))<nrow(dat)]
+  
+  #form pairs
+  pairs <- combn(names(dat)[-c(1:3)], 2, simplify = FALSE)
+  
+  #run p-values on each test  
+  test.results<- lapply(pairs, function(z){
+    
+    temp <- dat[, c("iteration", "fold", z)] %>%
+      pivot_longer(cols = all_of(z), names_to = "model", values_to = "values")
+    
+    names(temp)[names(temp) == "iteration"] <- "r"
+    names(temp)[names(temp) == "fold"]      <- "k"
+    
+    temp <- as.data.frame(temp)
+    
+    repkfold_ttest(temp, 
+                   n1 =train.set.size , 
+                   n2 = test.set.size, 
+                   k=10, r=20) 
+  })
+  
+  #unlist p-values
+  p_values<-unlist(sapply(test.results,function(x){x[2]}))
+  
+  #adjust for multiple corections
+  p_values.A<-p.adjust(p_values, method = "holm")
+  
+  #set names
+  names(p_values.A)<-sapply(pairs, function(x){paste(x[1], x[2], 
+                                                     sep="-")})  
+  #save letters
+  letters <-as.data.frame(multcompLetters(p_values.A)[1])
+  
+  #convert to wide format
+  long_data <- pivot_longer(
+    dat,
+    cols = names(dat)[-c(1:3)],
+    names_to = "method",
+    values_to = "values"
+  )
+  
+  #change factor order
+  long_data$method <- factor(long_data$method, levels = c("rrBLUP", "rrBLUP_int", "rf", "rf_tune", "rf_weight2", "rf_weight10"))
+  
+  #drop empty levels 
+  long_data$method<-droplevels(long_data$method)
+  
+  #aggregate step 1
+  plot_data <- aggregate(values~method+iteration, data=long_data, mean)
+  
+  #aggregate step 2
+  plot_data <- aggregate(values~method, data=plot_data, 
+                         FUN = function(x){c(mean=mean(x),
+                                             se=sd(x)/sqrt(length(x)))})
+  
+  plot_data <- do.call(data.frame, plot_data)
+  names(plot_data) <- c("method", "mean", "se")
+  
+  #run merge for data and letters
+  plot_data<-merge(plot_data,letters, by.x="method", by.y=0)
+  
+  #form table to save as main results
+  temp<-setNames(data.frame(plot_data$method, 
+                            paste0(sprintf("%.3f", plot_data$mean),plot_data$Letters)), 
+                 c("method", traits[i]))
+  
+  #save to main results
+  results_pccc <- merge(results_pccc,temp, by="method", all = T)
+  
+  #form boxplots with letter labels overlaid
+  
+  if(traits[i]=="trait.90"){ 
+    label_offset<- diff(range(plot_data$mean)) * 0.15 
+  }else{
+    label_offset<- diff(range(plot_data$mean)) * 0.05 }
+  
+  plot_point  <- ggplot(plot_data, aes(x = method, y = mean)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    geom_text(aes(label = Letters, y = mean + label_offset + se)) +
+    theme_minimal()+
+    labs(x="Method",
+         y = "PCCC",
+         title =sub("trait\\.", "Characteristic no. ", traits[i]) )
+  
+  ggsave(paste0("outputs/predict_final_plots/pccc_point_plot_with_letters_",
+                traits[i],".jpeg"), plot_point, 
+         height = 4, 
+         width = 5)
+  
+  
+}
+#save results
+
+#save PCCC letters 
+
+#sort on of methods 
+results_pccc <- results_pccc[match(c("rrBLUP", 
+                                     "rrBLUP_int", 
+                                     "rf", 
+                                     "rf_tune", 
+                                     "rf_weight2", 
+                                     "rf_weight10"), results_pccc$method), ]
+#move methods to row names
+row.names(results_pccc) <- results_pccc$method
+results_pccc <-results_pccc[,-1]
+
+#sort on order of traits
+trait_num <- as.numeric(gsub("trait\\.", "", names(results_pccc)))
+results_pccc<-results_pccc[,names(results_pccc)[order(trait_num)]]
+
+#save final data
+write.csv(results_pccc,"outputs/predict_final_plots/pccc_letters_table.csv")
+
+# Part 7 - scatter for PCCC
 
 #clean enviro
 rm(list=ls(all=TRUE))
@@ -371,9 +644,6 @@ trait_name<-sub("^results_pccc_(trait\\.[0-9]+)\\.csv$", "\\1", files_to_read)
 #save results object
 results_pccc <- data.frame()
 
-#add check for NA
-results_NA_pccc <- data.frame()
-
 #run loop for bind
 
 for (i in 1:length(files_to_read)){
@@ -382,16 +652,11 @@ for (i in 1:length(files_to_read)){
   dat <- read.csv(paste0("outputs/predict_outs/",files_to_read[i]), header = T)
   
   #first col was not used, so can be removed
-  
   dat <- dat[,-1]
-  
-  #run significance test
-  #iteration treated as a block
   
   #convert to wide format
   n <- names(dat)
   dat_long<-dat
-  dat_long$iteration <- as.factor(c(1:20))
   
   dat_long <- dat_long %>%         
     pivot_longer(
@@ -401,77 +666,21 @@ for (i in 1:length(files_to_read)){
     as.data.frame()
   
   #fix factor order
-  
   dat_long$model <-factor(dat_long$model, levels= c("rrBLUP_int",
-                                                  "rf",
-                                                  "rf_tune",
-                                                  "rf_weight2",
-                                                  "rf_weight10"))
+                                                    "rf",
+                                                    "rf_tune",
+                                                    "rf_weight2",
+                                                    "rf_weight10"))
   #clean 
   dat_long <- dat_long[ !is.na(dat_long$accuracy),]
   dat_long <- droplevels(dat_long)
   
-  #run mixed model
-  
-  m <- lmer(accuracy ~ model + (1|iteration), data =dat_long)
-  
-  #save means for pccc results and anova resuts
-  
   results_pccc <-rbind(results_pccc,
-                      data.frame(traits = trait_name[i],  
-                                 as.data.frame(t(colMeans(dat, na.rm=T))),
-                                 as.data.frame(anova(m))))
-  #count na
-  
-  results_NA_pccc <- rbind(results_NA_pccc,
-                          data.frame(traits =trait_name[i], 
-                                     as.data.frame(t(colSums(is.na(dat))))))
-  
-  #form box plots
-  
-  #extract BLUEs/emm object
-  emm <- emmeans(m, ~ model)
-  
-  #pair-wise comparisons with tukey adjustment
-  res.cld<-multcomp::cld(emm, adjust = "tukey", Letters=LETTERS, sort = F)
-  
-  #form boxplots with letter labels overlaid
-  p <- ggplot(res.cld, aes(x = model, y = emmean)) +
-    geom_point(size = 3) +
-    geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.2) +
-    geom_text(aes(label = .group, y = emmean + 0.01)) +
-    theme_minimal()+
-    labs(x="Method",
-         y = expression(italic("PCCC")),
-         title =trait_name[i] )
-  
-  #form boxplots with no letter labels overlaid
-  q <- ggplot(res.cld, aes(x = model, y = emmean)) +
-    geom_point(size = 3)+ 
-    geom_errorbar(aes(ymin = emmean - SE, ymax = emmean + SE), width = 0.2) +
-    theme_minimal()+
-    labs(x="Method",
-         y = expression(italic("PCCC")),
-         title =trait_name[i] )
-  
-  ggsave(paste0("outputs/predict_final_plots/boxplot.PCCC.pred.sig.groups.method",
-                trait_name[i],
-                ".jpeg"),
-         p, width = 5, height = 4)
-  
-  ggsave(paste0("outputs/predict_final_plots/boxplot.PCCC.pred.no.groups.method",
-                trait_name[i],
-                ".jpeg"),
-         q, width = 5, height = 4)
+                       data.frame(traits = trait_name[i],  
+                                  as.data.frame(t(colMeans(dat, na.rm=T)))))
 }
-
-#save output
-write.csv(results_pccc,
-          "outputs/predict_final_plots/results_pccc.csv", row.names = F)
-
 #merge and plot for pccc plot
 results_pccc_h2<-merge(results_pccc, h2, by="traits")
-
 
 dat_long_pcccr_h2 <- tidyr::pivot_longer(results_pccc_h2, cols = c(rrBLUP_int,rf), names_to = "Variable", values_to = "Value")
 
@@ -488,5 +697,10 @@ scatter_pccc <- ggplot(dat_long_pcccr_h2, aes(x = h2, y = Value, color = Variabl
   guides(color = guide_legend(title = NULL))
 
 ggsave("outputs/predict_final_plots/scatter_pccc.jpeg", scatter_pccc, width = 6, height = 5)
+
+#save output
+write.csv(results_pccc,
+          "outputs/predict_final_plots/results_pccc.csv", row.names = F)
+
 
 writeLines(capture.output(sessionInfo()), "script.8.sessionInfo.txt")

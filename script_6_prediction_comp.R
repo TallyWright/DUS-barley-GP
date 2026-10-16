@@ -11,6 +11,13 @@ library(purrr)
 #load scripts
 source("inputs/deduplicateTWimproved.R")
 
+#added logging info function
+log_progress <- function(trait, iteration, fold, method, logfile) {
+  cat(sprintf("%s | trait=%s | iter=%s | fold=%s | method=%s | completed\n",
+              format(Sys.time(), "%Y-%m-%d %H:%M:%S"), trait, iteration, fold, method),
+      file = logfile, append = TRUE)
+}
+
 #index data
 geno.input<-"outputs/dat.geno.with.pheno.csv"
 pheno.input<-"outputs/dat.pheno.with.geno.csv"
@@ -26,11 +33,6 @@ major.loci<-read.csv(major.loci.input,header=T,row.names = 1)
 # Check if it exists, and create it if not
 if (!dir.exists("outputs/predict_outs")) {
   dir.create("outputs/predict_outs")
-}
-
-# Check if it exists, and create it if not
-if (!dir.exists("outputs/progress_reports")) {
-  dir.create("outputs/progress_reports")
 }
 
 #Part 2 - prepare data and settings
@@ -79,7 +81,11 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
     pheno_filt <- pheno[!is.na(pheno[,i]),]
     id <- row.names(geno_filt)
     
-    #run further marker QC if lost lines for each trait
+    
+	logfile <- paste0("outputs/predict_outs/progress_trait_", i, ".txt")
+	cat(sprintf("=== Trait %s started: %s ===\n", i, Sys.time()), file = logfile, append = TRUE)
+	
+	#run further marker QC if lost lines for each trait
     if(!nrow(geno_filt)==nrow(geno)){
       #run some initial QC to reduce marker set to useful markers
       #ensure no low MAF in the starting dataframe (some genotypes removed without phenotype data)
@@ -90,7 +96,13 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
       geno_filt<- deduplicate(geno_filt ,1)
     }
     
-    #form results data frame for cor
+    #save final data used for each trait
+	 write.csv(geno_filt, 
+              paste0("outputs/predict_outs/geno_data_", i, "_.csv"))
+     write.csv(pheno_filt, 
+              paste0("outputs/predict_outs/pheno_data_", i, "_.csv"))
+	
+	#form results data frame for cor
     results_cor <- as.data.frame(matrix(NA, nrow = iterations, ncol =  6)) #the number of prediction methods
     # fix names
     names(results_cor) <- c("rrBLUP","rrBLUP_int","rf","rf_tune", "rf_weight2","rf_weight10" )
@@ -106,9 +118,34 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
                                  mtry=as.numeric(), 
                                  nodesize=as.numeric(),
                                  pccc = as.numeric())
+	
+	#create object to save original folds 
+	results_all_folds_cor <- data.frame(trait=character(), 
+				iteration=numeric(),
+				fold=numeric(),
+				rrBLUP = numeric(),
+				rrBLUP_int = numeric(),
+				rf = numeric(),
+				rf_tune = numeric(),
+				rf_weight2 =  numeric(),
+				rf_weight10 = numeric())
+				
+	results_all_folds_pccc <- data.frame(trait=character(), 
+				iteration=numeric(),
+				fold=numeric(),
+				rrBLUP = numeric(),
+				rrBLUP_int = numeric(),
+				rf = numeric(),
+				rf_tune = numeric(),
+				rf_weight2 =  numeric(),
+				rf_weight10 = numeric())											 
+    	
+	
+	#r-replicated k-fold cross validation
     
-    #r-replicated k-fold cross validation
-    
+	#set seed here for reproducibility (does not correlate fold iterations)
+    set.seed(42) 
+	
     #this part is the r-replicated
     for (j in c(1:iterations)){
       
@@ -135,7 +172,9 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
           #set train 
           pheno_train <- pheno_filt[train,i]
           geno_train <- as.matrix(geno_filt[train,])
-        
+		  
+		  #log progress
+		  log_progress(i, j, counter, "prediction start", logfile)
       
           ######################
           #run ridge regression
@@ -158,8 +197,11 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
           #save results with rounding to integer
           results_folds_cor[counter, 2]  <- cor(as.integer(round(pred_test)), pheno_test, use="complete")
           results_folds_pccc[counter, 2] <- mean(as.integer(round(pred_test))==pheno_test, na.rm=TRUE)
-      
-          ######################
+		  
+		  #log progress
+		  log_progress(i, j, counter, "rrBLUP", logfile)
+          
+		  ######################
           #random forest default
           ######################
           
@@ -178,8 +220,10 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
           results_folds_cor[counter, 3] <- cor(as.numeric(as.character(predicted)),as.numeric(as.character(rf.test$y)))
           results_folds_pccc[counter, 3] <- mean(as.character(predicted)==as.character(rf.test$y),
                                                  na.rm=TRUE)
+          #log progress
+		  log_progress(i, j, counter, "rf_default", logfile)
           
-          ##########################
+		  ##########################
           #random forest with tuning
           ##########################
           
@@ -242,8 +286,10 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
                                        mtry=best_params$mtry, 
                                        nodesize=best_params$nodesize,
                                        pccc = best_params$pccc))
-            
-          ##########################
+          #log progress
+		  log_progress(i, j, counter, "rf_tuning", logfile)  
+          
+		  ##########################
           #random forest with weighting
           ##########################
           
@@ -278,8 +324,10 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
             results_folds_pccc[counter, 5] <- mean(as.character(predicted)==
                                                      as.character(rf.test$y), na.rm=TRUE)
             
+            #log progress
+		    log_progress(i, j, counter, "rf_weight2", logfile)
             
-            #set all weights as 1   
+			#set all weights as 1   
             wts<-rep(1,length(rf.train[,2:ncol(rf.train)]))
             
             #set major loci markers to 10
@@ -297,7 +345,8 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
             results_folds_cor[counter, 6] <- cor(as.numeric(as.character(predicted)),as.numeric(as.character(rf.test$y)))
             results_folds_pccc[counter, 6] <- mean(as.character(predicted)==
                                                      as.character(rf.test$y), na.rm=TRUE)
-            
+            #log progress
+		    log_progress(i, j, counter, "rf_weight10", logfile)
             
           }#if for major loci
           
@@ -305,12 +354,12 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
         }
       
       #update main results with means of outfolds 
-      results_cor[j , "rrBLUP"     ] <- mean(results_folds_cor$V1)
-      results_cor[j , "rrBLUP_int" ] <- mean(results_folds_cor$V2)
-      results_cor[j , "rf"         ] <- mean(results_folds_cor$V3)
-      results_cor[j , "rf_tune"    ] <- mean(results_folds_cor$V4)
-      results_cor[j , "rf_weight2"  ] <- mean(results_folds_cor$V5)
-      results_cor[j , "rf_weight10"  ] <- mean(results_folds_cor$V6)
+      results_cor[j , "rrBLUP"     ] <- mean(results_folds_cor$V1, na.rm=TRUE)
+      results_cor[j , "rrBLUP_int" ] <- mean(results_folds_cor$V2, na.rm=TRUE)
+      results_cor[j , "rf"         ] <- mean(results_folds_cor$V3, na.rm=TRUE)
+      results_cor[j , "rf_tune"    ] <- mean(results_folds_cor$V4, na.rm=TRUE)
+      results_cor[j , "rf_weight2"  ] <- mean(results_folds_cor$V5, na.rm=TRUE)
+      results_cor[j , "rf_weight10"  ] <- mean(results_folds_cor$V6, na.rm=TRUE)
       
       results_pccc[j , "rrBLUP"     ] <- mean(results_folds_pccc$V1)
       results_pccc[j , "rrBLUP_int" ] <- mean(results_folds_pccc$V2)
@@ -318,15 +367,22 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
       results_pccc[j , "rf_tune"    ] <- mean(results_folds_pccc$V4)
       results_pccc[j , "rf_weight2"  ] <- mean(results_folds_pccc$V5)
       results_pccc[j , "rf_weight10"  ] <- mean(results_folds_pccc$V6)
-      
-    #save report for progress
-      
-      cat(sprintf("i=%s, j=%s completed\n", i, j),
-          file = paste0("update_i_", i, "_j_", j, ".txt"))
-      
+
+	  #save all fold results
+	  
+	  #rename before merge
+      names(results_folds_cor)  <- c("rrBLUP","rrBLUP_int","rf","rf_tune","rf_weight2","rf_weight10")
+      names(results_folds_pccc) <- c("rrBLUP","rrBLUP_int","rf","rf_tune","rf_weight2","rf_weight10")
+  
+	  results_all_folds_cor <- rbind(results_all_folds_cor,
+		cbind(data.frame(trait = i, iteration = j, fold = 1:10), results_folds_cor))
+
+	  results_all_folds_pccc <- rbind(results_all_folds_pccc,
+		cbind(data.frame(trait = i, iteration = j, fold = 1:10), results_folds_pccc))
+
       }
     
-    #save results for each trait
+    #save mean results for each trait
     
   write.csv(results_cor, 
               paste0("outputs/predict_outs/results_cor_", i, ".csv"),
@@ -339,6 +395,15 @@ foreach(i = traits, .packages = c("rrBLUP", "randomForestSRC","caret")) %dopar% 
   write.csv(results_tuning, 
               paste0("outputs/predict_outs/results_tuning_", i, ".csv"),
               row.names=F)
+			  
+  write.csv(results_all_folds_cor,
+                paste0("outputs/predict_outs/results_all_folds_cor_", i, ".csv"),
+              row.names=F)
+			  
+  write.csv(results_all_folds_pccc,
+                paste0("outputs/predict_outs/results_all_folds_pccc_", i, ".csv"),
+              row.names=F)
+  
 }
 
 stopCluster(cl)    
